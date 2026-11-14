@@ -1,0 +1,38 @@
+# Build artifacts
+/target/
+**/target/
+**/*.rs.bk
+*.exe
+*.pdb
+
+# Local harness runtime & session state
+/.harness/
+*.bin
+*.log
+/llama.log
+/main.log
+/config/config.local.yaml
+/config/config.local.yml
+/config/config.local.json
+MEMORY.md
+
+# OS / Editor files
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+.vscode/
+.idea/
+
+# Secrets & local web artifacts
+.env
+.env.*
+*.pem
+*.key
+**/node_modules/
+**/dist/
+
+
+
+
+MEMORY.md

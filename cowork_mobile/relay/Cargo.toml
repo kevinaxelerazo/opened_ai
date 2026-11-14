@@ -1,0 +1,14 @@
+[package]
+name = "mcp-sse-relay"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tokio = { version = "1.40", features = ["full"] }
+serde_json = "1.0"
+anyhow = "1.0"
+tokio-util = { version = "0.7", features = ["codec"] }
+tokio-stream = "0.1"
+uuid = { version = "1.10", features = ["v4"] }
+sse = "0.12"
+serde = { version = "1.0", features = ["derive"] }
