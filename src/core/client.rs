@@ -89,6 +89,7 @@ pub struct LlmResponse {
     pub prompt_tokens: usize,
     pub completion_tokens: usize,
     pub tokens_per_sec: f64,
+    #[allow(dead_code)]
     pub elapsed_ms: u128,
 }
 
@@ -116,18 +117,22 @@ impl LlamaClient {
         self.think_regex.replace_all(text, "").trim().to_string()
     }
 
-    /// Prepara los mensajes podando cualquier bloque <think> histórico
+    /// Prepara los mensajes podando cualquier bloque <think> histórico (si `strip_thinking`
+    /// es true) y garantizando que todo `tool_calls[].function.arguments` contenga JSON válido
+    /// para evitar HTTP 500 en plantillas `--jinja` de llama-server.
     pub fn sanitize_history(&self, messages: &[ChatMessage], strip_thinking: bool) -> Vec<ChatMessage> {
-        if !strip_thinking {
-            return messages.to_vec();
-        }
         messages
             .iter()
             .map(|m| {
                 let mut clean = m.clone();
                 if clean.role == "assistant" {
-                    if let Some(ref c) = clean.content {
-                        clean.content = Some(self.strip_thinking(c));
+                    if strip_thinking {
+                        if let Some(ref c) = clean.content {
+                            clean.content = Some(self.strip_thinking(c));
+                        }
+                    }
+                    if let Some(ref tcs) = clean.tool_calls {
+                        clean.tool_calls = Some(sanitize_tool_calls_for_storage(tcs));
                     }
                 }
                 clean
@@ -410,41 +415,96 @@ impl LlamaClient {
         })
     }
 
-    /// Guarda el estado de la KV Cache del slot 0 (ej. antes de ejecutar un subagente)
-    pub async fn save_slot(&self, slot_id: usize, filename: &str) -> Result<bool> {
+    /// Guarda el estado de la KV Cache del slot 0 (ej. antes de ejecutar un subagente).
+    /// Soporta tanto el proxy `/upstream/<model>/slots/<id>` de `llama-swap` como `/slots/<id>` directo.
+    pub async fn save_slot(&self, model: &str, slot_id: usize, filename: &str) -> Result<bool> {
         if !self.cfg.enable_slot_caching {
             return Ok(false);
         }
-        let url = format!(
+        if let Ok(running) = self.running_models().await {
+            if !running.is_empty()
+                && !running
+                    .iter()
+                    .any(|(m, state)| m == model && state == "ready")
+            {
+                return Ok(false);
+            }
+        }
+        let upstream_url = format!(
+            "{}/upstream/{}/slots/{}?action=save",
+            self.server_root_url(),
+            model,
+            slot_id
+        );
+        let payload = json!({ "filename": filename });
+        if let Ok(resp) = self
+            .http
+            .post(&upstream_url)
+            .json(&payload)
+            .timeout(Duration::from_secs(30))
+            .send()
+            .await
+        {
+            if resp.status().is_success() {
+                return Ok(true);
+            }
+            if resp.status().as_u16() != 404 {
+                return Ok(false);
+            }
+        }
+        let direct_url = format!(
             "{}/{}?action=save",
             self.cfg.slots_url.trim_end_matches('/'),
             slot_id
         );
         let res = self
             .http
-            .post(&url)
-            .json(&json!({ "filename": filename }))
-            .timeout(Duration::from_secs(10))
+            .post(&direct_url)
+            .json(&payload)
+            .timeout(Duration::from_secs(30))
             .send()
             .await;
         Ok(res.map(|r| r.status().is_success()).unwrap_or(false))
     }
 
-    /// Restaura el estado de la KV Cache del slot 0 (ej. al volver al TI Manager)
-    pub async fn restore_slot(&self, slot_id: usize, filename: &str) -> Result<bool> {
+    /// Restaura el estado de la KV Cache del slot 0 (ej. al volver al TI Manager).
+    pub async fn restore_slot(&self, model: &str, slot_id: usize, filename: &str) -> Result<bool> {
         if !self.cfg.enable_slot_caching {
             return Ok(false);
         }
-        let url = format!(
+        let restore_timeout = Duration::from_secs(self.cfg.timeout_seconds.max(180));
+        let upstream_url = format!(
+            "{}/upstream/{}/slots/{}?action=restore",
+            self.server_root_url(),
+            model,
+            slot_id
+        );
+        let payload = json!({ "filename": filename });
+        if let Ok(resp) = self
+            .http
+            .post(&upstream_url)
+            .json(&payload)
+            .timeout(restore_timeout)
+            .send()
+            .await
+        {
+            if resp.status().is_success() {
+                return Ok(true);
+            }
+            if resp.status().as_u16() != 404 {
+                return Ok(false);
+            }
+        }
+        let direct_url = format!(
             "{}/{}?action=restore",
             self.cfg.slots_url.trim_end_matches('/'),
             slot_id
         );
         let res = self
             .http
-            .post(&url)
-            .json(&json!({ "filename": filename }))
-            .timeout(Duration::from_secs(10))
+            .post(&direct_url)
+            .json(&payload)
+            .timeout(Duration::from_secs(30))
             .send()
             .await;
         Ok(res.map(|r| r.status().is_success()).unwrap_or(false))
@@ -554,6 +614,44 @@ impl LlamaClient {
     }
 }
 
+pub const INVALID_TOOL_ARGS_MARKER: &str = r#"{"_invalid_truncated_json":true}"#;
+
+/// Valida que los argumentos de una llamada a herramienta formen un objeto JSON válido.
+/// Evita que respuestas truncadas por `max_tokens` o bucles de repetición ejecuten tools
+/// con valores vacíos o corrompan plantillas `--jinja` en turnos posteriores.
+pub fn parse_valid_tool_args(raw: &str) -> Result<Value, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(json!({}));
+    }
+    match serde_json::from_str::<Value>(trimmed) {
+        Ok(v) if v.is_object() => Ok(v),
+        Ok(_) => Err(
+            "[ERROR ARGUMENTOS INVÁLIDOS]: `arguments` debe ser un objeto JSON válido. Vuelve a emitir la llamada completa y concisa.".to_string(),
+        ),
+        Err(e) => Err(format!(
+            "[ERROR ARGUMENTOS TRUNCADOS/INVÁLIDOS]: El JSON de `arguments` quedó incompleto o inválido ({}). Probablemente alcanzaste `max_tokens` o entraste en repetición. NO repitas listas largas ni pegues código; resume en <120 palabras y reintenta.",
+            e
+        )),
+    }
+}
+
+/// Devuelve una copia de `tool_calls` donde cualquier `arguments` inválido/truncado
+/// se reemplaza por un objeto JSON seguro (`INVALID_TOOL_ARGS_MARKER`) antes de persistir
+/// o reenviar al servidor `--jinja`.
+pub fn sanitize_tool_calls_for_storage(tool_calls: &[ToolCall]) -> Vec<ToolCall> {
+    tool_calls
+        .iter()
+        .map(|tc| {
+            let mut copy = tc.clone();
+            if parse_valid_tool_args(&copy.function.arguments).is_err() {
+                copy.function.arguments = INVALID_TOOL_ARGS_MARKER.to_string();
+            }
+            copy
+        })
+        .collect()
+}
+
 fn parse_props_n_ctx(val: &Value) -> Option<usize> {
     val["n_ctx"]
         .as_u64()
@@ -622,6 +720,40 @@ mod tests {
 
         let empty = json!({});
         assert_eq!(parse_props_n_ctx(&empty), None);
+    }
+
+    #[test]
+    fn sanitize_history_repairs_truncated_tool_call_json_even_without_think_strip() {
+        let cfg = ServerConfig {
+            base_url: "http://127.0.0.1:8080/v1".to_string(),
+            slots_url: "http://127.0.0.1:8080/slots".to_string(),
+            api_key: "local".to_string(),
+            timeout_seconds: 600,
+            enable_slot_caching: true,
+        };
+        let client = LlamaClient::new(cfg).expect("client");
+        assert!(parse_valid_tool_args(r#"{"agent_name":"semi_sr_dev","task_brief":"use axum::"#).is_err());
+        assert!(parse_valid_tool_args(r#"{"agent_name":"semi_sr_dev","task_brief":"ok"}"#).is_ok());
+
+        let broken_msg = ChatMessage {
+            role: "assistant".to_string(),
+            content: Some("<think>reasoning</think>ok".to_string()),
+            tool_calls: Some(vec![ToolCall {
+                id: "call_1".to_string(),
+                call_type: "function".to_string(),
+                function: FunctionCall {
+                    name: "delegate_subagent".to_string(),
+                    arguments: r#"{"agent_name":"semi_sr_dev","task_brief":"use axum::"#.to_string(),
+                },
+            }]),
+            tool_call_id: None,
+            name: None,
+        };
+
+        let sanitized = client.sanitize_history(&[broken_msg], false);
+        let args = &sanitized[0].tool_calls.as_ref().unwrap()[0].function.arguments;
+        assert_eq!(args, INVALID_TOOL_ARGS_MARKER);
+        assert!(serde_json::from_str::<Value>(args).is_ok());
     }
 }
 

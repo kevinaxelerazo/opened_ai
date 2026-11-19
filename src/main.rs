@@ -104,6 +104,36 @@ enum Commands {
         #[arg(short, long, default_value_t = 8090)]
         port: u16,
     },
+
+    /// [Cowork Mobile] Lanza herramientas de coworking: relay, mcp, acp, ttyd
+    Cowork {
+        /// Subcommand: relay, mcp, acp, ttyd (default: relay)
+        #[command(subcommand)]
+        subcommand: Option<CoworkSubcommand>,
+
+        /// Puerto del relay (default: 8080)
+        #[arg(long, default_value = "8080")]
+        port: u16,
+
+        /// Token de autenticación para el relay (RELAY_TOKEN)
+        #[arg(long)]
+        token: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum CoworkSubcommand {
+    /// Lanza el relay SSE (mcp-sse-relay)
+    Relay,
+
+    /// Lanza el servidor MCP (mcp_server.rs --sse)
+    Mcp,
+
+    /// Lanza el servidor ACP (acp_server.rs --sse)
+    Acp,
+
+    /// Lanza ttyd terminal web (ttyd -b 0.0.0.0 -p 7681 "lh.exe mcp")
+    Ttyd,
 }
 
 #[tokio::main]
@@ -232,6 +262,70 @@ async fn main() -> Result<()> {
         }
         Commands::Serve { host, port } => {
             run_openai_proxy_server(&config, &workspace, &host, port).await?;
+        }
+        Commands::Cowork { subcommand, port, token } => {
+            let relay_dir = workspace.join("cowork_mobile").join("relay");
+            let port = port.to_string();
+            let token = token.unwrap_or_default();
+
+            match subcommand {
+                Some(CoworkSubcommand::Relay) | None => {
+                    println!("🚀 Lanzando relay SSE desde: {}", relay_dir.display());
+                    println!("   Puerto: {}, Token: {}", port, if token.is_empty() { "(no set)" } else { "****" });
+                    let mut cmd = std::process::Command::new("cargo");
+                    cmd.arg("run").arg("--release").arg("--bin").arg("mcp-sse-relay");
+                    cmd.current_dir(&relay_dir);
+                    cmd.env("PORT", &port);
+                    if !token.is_empty() {
+                        cmd.env("RELAY_TOKEN", &token);
+                    }
+                    let status = cmd.status().expect("Failed to launch relay");
+                    if !status.success() {
+                        eprintln!("❌ Relay exited with status: {}", status);
+                        std::process::exit(1);
+                    }
+                }
+                Some(CoworkSubcommand::Mcp) => {
+                    println!("🚀 Lanzando MCP server desde: {}", relay_dir.display());
+                    let mut cmd = std::process::Command::new("cargo");
+                    cmd.arg("run").arg("--release").arg("--").arg("--sse");
+                    cmd.current_dir(&relay_dir);
+                    cmd.env("PORT", &port);
+                    if !token.is_empty() {
+                        cmd.env("RELAY_TOKEN", &token);
+                    }
+                    let status = cmd.status().expect("Failed to launch MCP server");
+                    if !status.success() {
+                        eprintln!("❌ MCP server exited with status: {}", status);
+                        std::process::exit(1);
+                    }
+                }
+                Some(CoworkSubcommand::Acp) => {
+                    println!("🚀 Lanzando ACP server desde: {}", relay_dir.display());
+                    let mut cmd = std::process::Command::new("cargo");
+                    cmd.arg("run").arg("--release").arg("--").arg("--sse");
+                    cmd.current_dir(&relay_dir);
+                    cmd.env("PORT", &port);
+                    if !token.is_empty() {
+                        cmd.env("RELAY_TOKEN", &token);
+                    }
+                    let status = cmd.status().expect("Failed to launch ACP server");
+                    if !status.success() {
+                        eprintln!("❌ ACP server exited with status: {}", status);
+                        std::process::exit(1);
+                    }
+                }
+                Some(CoworkSubcommand::Ttyd) => {
+                    println!("🚀 Lanzando ttyd terminal web (puerto 7681)");
+                    let mut cmd = std::process::Command::new("ttyd");
+                    cmd.arg("-b").arg("0.0.0.0").arg("-p").arg("7681").arg("lh.exe").arg("mcp");
+                    let status = cmd.status().expect("Failed to launch ttyd");
+                    if !status.success() {
+                        eprintln!("❌ ttyd exited with status: {}", status);
+                        std::process::exit(1);
+                    }
+                }
+            }
         }
     }
 

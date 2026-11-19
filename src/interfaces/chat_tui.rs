@@ -1,5 +1,7 @@
 use crate::config::HarnessConfig;
-use crate::core::client::{ChatMessage, LlamaClient};
+use crate::core::client::{
+    parse_valid_tool_args, sanitize_tool_calls_for_storage, ChatMessage, LlamaClient,
+};
 use crate::core::loop_guard::{extract_tolerant_tool_calls, LoopGuard};
 use crate::core::orchestrator::{
     format_plan_progress_bar, run_orchestrator_with_session, OrchestratorSession,
@@ -207,11 +209,14 @@ pub async fn run_interactive_chat(config: &HarnessConfig, workspace: &Path) -> R
                             tui_hud::push_user_prompt(&trimmed);
                         }
 
-                        if handle_local_command(&trimmed, &client, config, workspace, &mut ctx)
-                            .await
+                        let effective_prompt = match handle_local_command(
+                            &trimmed, &client, config, workspace, &mut ctx,
+                        )
+                        .await
                         {
-                            continue;
-                        }
+                            LocalCommandOutcome::Handled => continue,
+                            LocalCommandOutcome::RunPrompt(p) => p,
+                        };
 
                         // Ejecutar tarea LLM permitiendo seguir scrolleando, usar Ctrl+O, responder `clarify` o cancelar con Ctrl+C
                         tui_hud::set_input("", 0, true);
@@ -224,7 +229,11 @@ pub async fn run_interactive_chat(config: &HarnessConfig, workspace: &Path) -> R
                         ticker.tick().await;
                         {
                             let fut = execute_prompt_turn(
-                                &trimmed, &client, config, workspace, &mut ctx,
+                                &effective_prompt,
+                                &client,
+                                config,
+                                workspace,
+                                &mut ctx,
                             );
                             tokio::pin!(fut);
 
@@ -481,12 +490,40 @@ async fn run_plain_repl(
         if trimmed == "/exit" || trimmed == "/quit" || trimmed == "exit" || trimmed == "quit" {
             break;
         }
-        if handle_local_command(&trimmed, client, config, workspace, ctx).await {
-            continue;
-        }
-        execute_prompt_turn(&trimmed, client, config, workspace, ctx).await;
+        let effective_prompt =
+            match handle_local_command(&trimmed, client, config, workspace, ctx).await {
+                LocalCommandOutcome::Handled => continue,
+                LocalCommandOutcome::RunPrompt(p) => p,
+            };
+        execute_prompt_turn(&effective_prompt, client, config, workspace, ctx).await;
     }
     Ok(())
+}
+
+enum LocalCommandOutcome {
+    Handled,
+    RunPrompt(String),
+}
+
+/// Parsea `/resume` o `/resume <instrucción>`.
+/// - `None` si la entrada no corresponde al comando `/resume`.
+/// - `Some(None)` si es `/resume` sin instrucción adicional.
+/// - `Some(Some(followup))` si incluye una instrucción de seguimiento para ejecutar tras restaurar.
+fn split_resume_command(input: &str) -> Option<Option<&str>> {
+    let trimmed = input.trim();
+    if trimmed == "/resume" {
+        return Some(None);
+    }
+    let rest = trimmed.strip_prefix("/resume")?;
+    if !rest.starts_with(char::is_whitespace) {
+        return None;
+    }
+    let followup = rest.trim();
+    if followup.is_empty() {
+        Some(None)
+    } else {
+        Some(Some(followup))
+    }
 }
 
 async fn handle_local_command(
@@ -495,10 +532,10 @@ async fn handle_local_command(
     config: &HarnessConfig,
     workspace: &Path,
     ctx: &mut AppCtx,
-) -> bool {
+) -> LocalCommandOutcome {
     if input == "/help" || input == "?" {
         print_help();
-        return true;
+        return LocalCommandOutcome::Handled;
     }
 
     if input == "/think" {
@@ -512,7 +549,7 @@ async fn handle_local_command(
                 "💭 Cadenas <think> COLAPSADAS (usa `Ctrl+O` o `/think` para expandir)."
             },
         );
-        return true;
+        return LocalCommandOutcome::Handled;
     }
 
     if input == "/clear" {
@@ -550,10 +587,10 @@ async fn handle_local_command(
                 );
             }
         }
-        return true;
+        return LocalCommandOutcome::Handled;
     }
 
-    if input == "/resume" {
+    if let Some(followup) = split_resume_command(input) {
         match OrchestratorSession::load_saved(workspace) {
             Some(loaded) => {
                 let count = loaded.messages.len();
@@ -574,6 +611,9 @@ async fn handle_local_command(
                     msg.push_str(&bar);
                 }
                 tui_hud::push_notice(0, false, &msg);
+                if let Some(next_prompt) = followup {
+                    return LocalCommandOutcome::RunPrompt(next_prompt.to_string());
+                }
             }
             None => {
                 tui_hud::push_notice(
@@ -583,7 +623,7 @@ async fn handle_local_command(
                 );
             }
         }
-        return true;
+        return LocalCommandOutcome::Handled;
     }
 
     if input == "/model" || input.starts_with("/model ") {
@@ -604,11 +644,11 @@ async fn handle_local_command(
                 ctx.default_mgr_max_iters,
             )
             .await;
-            return true;
+            return LocalCommandOutcome::Handled;
         }
         // `/model <id>` se ejecuta dentro de `execute_prompt_turn` para permitir scroll,
         // `Ctrl+C` y monitoreo en vivo mientras llama-swap realiza el hot-swap del GGUF.
-        return false;
+        return LocalCommandOutcome::RunPrompt(input.to_string());
     }
 
     if input == "/agents" {
@@ -626,7 +666,7 @@ async fn handle_local_command(
             "config/config.yaml",
             body.trim_end(),
         );
-        return true;
+        return LocalCommandOutcome::Handled;
     }
 
     if input == "/skills" {
@@ -640,7 +680,7 @@ async fn handle_local_command(
             ));
         }
         tui_hud::push_card("📚", "SKILLS INSTALADAS", "Lazy-Loaded", body.trim_end());
-        return true;
+        return LocalCommandOutcome::Handled;
     }
 
     if input == "/plan" {
@@ -661,7 +701,7 @@ async fn handle_local_command(
                 "ℹ️ Aún no existe `.harness/PLAN.md` en este workspace.",
             );
         }
-        return true;
+        return LocalCommandOutcome::Handled;
     }
 
     if input == "/status" {
@@ -691,10 +731,10 @@ async fn handle_local_command(
                 );
             }
         }
-        return true;
+        return LocalCommandOutcome::Handled;
     }
 
-    false
+    LocalCommandOutcome::RunPrompt(input.to_string())
 }
 
 async fn execute_prompt_turn(
@@ -1176,6 +1216,7 @@ async fn run_direct_single_model_turn(
             return;
         }
 
+        let sanitized_calls = sanitize_tool_calls_for_storage(&tool_calls);
         history.push(ChatMessage {
             role: "assistant".to_string(),
             content: if resp.content.is_empty() {
@@ -1183,39 +1224,47 @@ async fn run_direct_single_model_turn(
             } else {
                 Some(resp.content.clone())
             },
-            tool_calls: Some(tool_calls.clone()),
+            tool_calls: Some(sanitized_calls),
             tool_call_id: None,
             name: None,
         });
 
         for tc in tool_calls {
-            let (verb, target) = tui_hud::format_tool_target(&tc.function.name, &tc.function.arguments);
-            tui_hud::set_activity(format!(
-                "⚡ {} ({}/{}) • {} {}",
-                model_id, step, DIRECT_MODEL_MAX_STEPS, verb, target
-            ));
-            tui_hud::push_action(
-                0,
-                verb,
-                &target,
-                &format!("paso {}/{}", step, DIRECT_MODEL_MAX_STEPS),
-            );
+            let tool_output = if let Err(err_msg) = parse_valid_tool_args(&tc.function.arguments) {
+                tui_hud::push_notice(
+                    0,
+                    true,
+                    &format!("⚠️ Tool `{}` truncada/inválida; reintentando.", tc.function.name),
+                );
+                err_msg
+            } else {
+                let (verb, target) = tui_hud::format_tool_target(&tc.function.name, &tc.function.arguments);
+                tui_hud::set_activity(format!(
+                    "⚡ {} ({}/{}) • {} {}",
+                    model_id, step, DIRECT_MODEL_MAX_STEPS, verb, target
+                ));
+                tui_hud::push_action(
+                    0,
+                    verb,
+                    &target,
+                    &format!("paso {}/{}", step, DIRECT_MODEL_MAX_STEPS),
+                );
 
-            let tool_output = match loop_guard.check_call(&tc.function.name, &tc.function.arguments)
-            {
-                Ok(()) => {
-                    execute_local_tool(
-                        &tc.function.name,
-                        &tc.function.arguments,
-                        workspace,
-                        config.context_budget.max_shell_output_chars,
-                        &config.server.base_url,
-                    )
-                    .await
-                }
-                Err(guard_msg) => {
-                    tui_hud::push_notice(0, true, &format!("⚠️ {}", guard_msg));
-                    guard_msg
+                match loop_guard.check_call(&tc.function.name, &tc.function.arguments) {
+                    Ok(()) => {
+                        execute_local_tool(
+                            &tc.function.name,
+                            &tc.function.arguments,
+                            workspace,
+                            config.context_budget.max_shell_output_chars,
+                            &config.server.base_url,
+                        )
+                        .await
+                    }
+                    Err(guard_msg) => {
+                        tui_hud::push_notice(0, true, &format!("⚠️ {}", guard_msg));
+                        guard_msg
+                    }
                 }
             };
 
@@ -1311,7 +1360,7 @@ NAVEGACIÓN, RAZONAMIENTO Y SESIÓN
   • Alt+▲ / Alt+▼               → Historial de prompts enviados anteriormente
   • Ctrl+C                      → Si está ejecutando: cancela la corrida actual; si está libre: sale a terminal
   • /plan                       → Muestra la barra de avance y `.harness/PLAN.md`
-  • /resume                     → Reanuda la última sesión guardada en `.harness/manager_session.json`
+  • /resume [instrucción]       → Reanuda `.harness/manager_session.json` (y ejecuta la instrucción si se incluye)
   • /clear                      → Limpia memoria del modo activo (y sesión guardada en modo Orquestador)
   • /exit  (o /quit)            → Sale del TUI restaurando la terminal intacta
 
@@ -1322,4 +1371,25 @@ INSPECCIÓN Y HERRAMIENTAS
   • /vision <url|html> [prompt] → Captura Headless Chrome + auditoría DOM + Visión multimodal
   • /rag <consulta|url>         → Búsqueda técnica multi-fuente (anti-CAPTCHA) o URL a Markdown";
     tui_hud::push_card("📖", "GUÍA DE COMANDOS OPENED-AI", "v0.1", body);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn split_resume_command_extracts_followup_prompt() {
+        assert_eq!(split_resume_command("/resume"), Some(None));
+        assert_eq!(split_resume_command("  /resume   "), Some(None));
+        assert_eq!(
+            split_resume_command("/resume continúa con el paso 3"),
+            Some(Some("continúa con el paso 3"))
+        );
+        assert_eq!(
+            split_resume_command("/resume\t  arregla tests pendientes  "),
+            Some(Some("arregla tests pendientes"))
+        );
+        assert_eq!(split_resume_command("/resume_other foo"), None);
+        assert_eq!(split_resume_command("hola mundo"), None);
+    }
 }

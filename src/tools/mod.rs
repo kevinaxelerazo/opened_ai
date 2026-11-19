@@ -113,7 +113,7 @@ pub fn get_tools_schema(allowed_tools: &[String]) -> Vec<Value> {
                 "type": "function",
                 "function": {
                     "name": "apply_diff",
-                    "description": "Edita quirúrgicamente un archivo reemplazando el bloque `search` por `replace`.",
+                    "description": "Edita quirúrgicamente un archivo reemplazando el bloque `search` por `replace`. Puedes emitir de 2 a 4 llamadas `apply_diff` en un mismo turno para cambios cortos, independientes y no solapados en el mismo archivo.",
                     "parameters": {
                         "type": "object",
                         "properties": {
@@ -348,10 +348,34 @@ pub fn get_tools_schema(allowed_tools: &[String]) -> Vec<Value> {
 fn resolve_path(workspace: &Path, raw: &str) -> PathBuf {
     let p = PathBuf::from(raw);
     if p.is_absolute() {
-        p
-    } else {
-        workspace.join(p)
+        return p;
     }
+
+    let joined = workspace.join(&p);
+    if joined.exists() {
+        return joined;
+    }
+
+    if let Some(ws_name) = workspace.file_name().and_then(|n| n.to_str()) {
+        let trimmed = raw.trim_start_matches(['.', '/', '\\']);
+        let stripped = trimmed
+            .strip_prefix(&format!("{}/", ws_name))
+            .or_else(|| trimmed.strip_prefix(&format!("{}\\", ws_name)));
+
+        if let Some(rel) = stripped.filter(|s| !s.is_empty()) {
+            let candidate = workspace.join(rel);
+            if candidate.exists()
+                || candidate
+                    .parent()
+                    .is_some_and(|parent| parent != workspace && parent.exists())
+                || Path::new(rel).parent().is_some_and(|p| p.as_os_str().is_empty())
+            {
+                return candidate;
+            }
+        }
+    }
+
+    joined
 }
 
 /// Ejecuta una herramienta local y devuelve su salida compactada lista para el LLM
@@ -481,9 +505,18 @@ pub async fn execute_local_tool(
             let norm_replace = replace.replace("\r\n", "\n");
 
             if !norm_orig.contains(&norm_search) {
+                let snippet_hint = find_closest_snippet(&norm_orig, &norm_search)
+                    .map(|snippet| {
+                        format!(
+                            "\nFragmento más cercano en el archivo actual:\n{}",
+                            snippet
+                        )
+                    })
+                    .unwrap_or_default();
                 return format!(
-                    "[ERROR apply_diff]: El bloque `search` no coincide exactamente en {}. Usa `read_file` para verificar las líneas actuales.",
-                    file_path.display()
+                    "[ERROR apply_diff]: El bloque `search` no coincide exactamente en {}. Verifica indentación/contexto antes de reintentar.{}",
+                    file_path.display(),
+                    snippet_hint
                 );
             }
 
@@ -789,6 +822,134 @@ fn handle_project_memory(workspace: &Path, args: &Value) -> String {
     }
 }
 
+/// Busca la región más cercana al bloque `search` fallido dentro de `norm_orig`
+/// y devuelve ~12-15 líneas numeradas alrededor de la mejor coincidencia.
+fn find_closest_snippet(norm_orig: &str, norm_search: &str) -> Option<String> {
+    let orig_lines: Vec<&str> = norm_orig.lines().collect();
+    if orig_lines.is_empty() {
+        return None;
+    }
+
+    let search_lines: Vec<&str> = norm_search
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
+    if search_lines.is_empty() {
+        return None;
+    }
+
+    let first = search_lines[0];
+
+    // 1) Coincidencia exacta recortada de la primera línea no vacía de `search`
+    let exact_first_matches: Vec<usize> = orig_lines
+        .iter()
+        .enumerate()
+        .filter(|(_, line)| line.trim() == first)
+        .map(|(idx, _)| idx)
+        .collect();
+
+    let best_idx = if !exact_first_matches.is_empty() {
+        exact_first_matches
+            .into_iter()
+            .max_by_key(|&idx| {
+                let window_end = (idx + search_lines.len() + 2).min(orig_lines.len());
+                let matched = search_lines
+                    .iter()
+                    .filter(|&&s| {
+                        orig_lines[idx..window_end]
+                            .iter()
+                            .any(|ol| ol.trim() == s)
+                    })
+                    .count();
+                // Desempate a favor de la primera aparición (índice menor)
+                (matched, std::cmp::Reverse(idx))
+            })
+    } else {
+        // 2) Fallback por mayor coincidencia de tokens (o subcadena) entre líneas de `search` y `orig`
+        let tokenize = |s: &str| -> Vec<String> {
+            s.split(|c: char| !c.is_alphanumeric() && c != '_')
+                .filter(|t| t.len() >= 2)
+                .map(|t| t.to_lowercase())
+                .collect()
+        };
+
+        let search_tokens: Vec<(&str, Vec<String>)> = search_lines
+            .iter()
+            .map(|&s| (s, tokenize(s)))
+            .collect();
+
+        let mut best: Option<(usize, usize)> = None;
+        for (idx, &orig_line) in orig_lines.iter().enumerate() {
+            let trimmed_orig = orig_line.trim();
+            if trimmed_orig.is_empty() {
+                continue;
+            }
+            let orig_tokens = tokenize(trimmed_orig);
+            let mut line_best_score = 0usize;
+
+            for (s_idx, (s_line, s_toks)) in search_tokens.iter().enumerate() {
+                let score = if trimmed_orig == *s_line {
+                    200 + s_line.len()
+                } else if trimmed_orig.len() >= 4
+                    && s_line.len() >= 4
+                    && (trimmed_orig.contains(*s_line) || s_line.contains(trimmed_orig))
+                {
+                    100 + trimmed_orig.len().min(s_line.len())
+                } else if !s_toks.is_empty() && !orig_tokens.is_empty() {
+                    let overlap: usize = s_toks
+                        .iter()
+                        .filter(|t| orig_tokens.iter().any(|ot| ot == *t))
+                        .count();
+                    let overlap_chars: usize = s_toks
+                        .iter()
+                        .filter(|t| orig_tokens.iter().any(|ot| ot == *t))
+                        .map(|t| t.len())
+                        .sum();
+                    if overlap > 0 {
+                        overlap * 10 + overlap_chars + if s_idx == 0 { 5 } else { 0 }
+                    } else {
+                        0
+                    }
+                } else {
+                    0
+                };
+                if score > line_best_score {
+                    line_best_score = score;
+                }
+            }
+
+            if line_best_score > 0 {
+                let replace_best = match best {
+                    None => true,
+                    Some((_, prev_score)) => line_best_score > prev_score,
+                };
+                if replace_best {
+                    best = Some((idx, line_best_score));
+                }
+            }
+        }
+        best.map(|(idx, _)| idx)
+    };
+
+    let idx = best_idx?;
+    let window = 14usize;
+    let mut start = idx.saturating_sub(5);
+    let end = (start + window).min(orig_lines.len());
+    if end == orig_lines.len() {
+        start = end.saturating_sub(window);
+    }
+
+    let snippet = orig_lines[start..end]
+        .iter()
+        .enumerate()
+        .map(|(offset, line)| format!("{:>4} | {}", start + offset + 1, line))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    Some(snippet)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -838,6 +999,171 @@ mod tests {
         assert!(r2.contains("Puerto API 8090"));
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolve_path_strips_redundant_workspace_prefix() {
+        let base = std::env::temp_dir().join(format!(
+            "oai_resolve_test_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let ws = base.join("cowork_mobile");
+        let auth_dir = ws.join("api").join("src").join("auth");
+        fs::create_dir_all(&auth_dir).unwrap();
+        let jwt = auth_dir.join("jwt.rs");
+        fs::write(&jwt, "// jwt").unwrap();
+
+        assert_eq!(
+            resolve_path(&ws, "cowork_mobile/api/src/auth/jwt.rs"),
+            jwt
+        );
+        assert_eq!(
+            resolve_path(&ws, "cowork_mobile\\api\\src\\auth\\jwt.rs"),
+            jwt
+        );
+        assert_eq!(
+            resolve_path(&ws, "cowork_mobile/api/src/auth/new_mod.rs"),
+            auth_dir.join("new_mod.rs")
+        );
+        assert_eq!(
+            resolve_path(&ws, "api/src/auth/jwt.rs"),
+            jwt
+        );
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[tokio::test]
+    async fn apply_diff_error_includes_closest_snippet() {
+        let base = std::env::temp_dir().join(format!(
+            "oai_apply_diff_snippet_test_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+
+        let sample = "\
+// line 1
+// line 2
+// line 3
+// line 4
+// line 5
+// line 6
+// line 7
+// line 8
+fn calculate_score(items: &[i32]) -> i32 {
+    let mut total = 0;
+    for item in items {
+        total += item;
+    }
+    total
+}
+// line 16
+// line 17
+// line 18
+// line 19
+// line 20
+";
+        fs::write(base.join("calc.rs"), sample).unwrap();
+
+        // Caso 1: primera línea coincide recortada, pero falla la indentación/línea siguiente
+        let args = json!({
+            "path": "calc.rs",
+            "search": "fn calculate_score(items: &[i32]) -> i32 {\n  let mut total = 999;",
+            "replace": "fn calculate_score(items: &[i32]) -> i32 {\n    let mut total = 1;"
+        });
+        let err = execute_local_tool(
+            "apply_diff",
+            &args.to_string(),
+            &base,
+            4000,
+            "http://127.0.0.1:8080/v1",
+        )
+        .await;
+
+        assert!(err.starts_with("[ERROR apply_diff]"), "got: {}", err);
+        assert!(err.contains("Fragmento más cercano"), "got: {}", err);
+        assert!(err.contains("   9 | fn calculate_score(items: &[i32]) -> i32 {"), "got: {}", err);
+        assert!(err.contains("  10 |     let mut total = 0;"), "got: {}", err);
+
+        // Caso 2: fallback por coincidencia de tokens cuando la primera línea tiene una ligera diferencia
+        let fallback = find_closest_snippet(
+            sample,
+            "pub fn calculate_score(items: &[u64]) -> u64 {\n    let total = 1;",
+        )
+        .expect("should find closest snippet by tokens");
+        assert!(fallback.contains("9 | fn calculate_score(items: &[i32]) -> i32 {"));
+
+        // Caso 3: búsqueda sin coincidencias retorna None
+        assert!(find_closest_snippet(sample, "zzzz_nonexistent_token_xyz").is_none());
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[tokio::test]
+    async fn multiple_apply_diff_calls_apply_independently_and_preserve_good_hunks() {
+        let base = std::env::temp_dir().join(format!(
+            "oai_multi_diff_test_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&base).unwrap();
+        let file = base.join("service.rs");
+        fs::write(
+            &file,
+            "use old_crate::A;\n\nfn one() -> i32 {\n    1\n}\n\nfn two() -> i32 {\n    2\n}\n",
+        )
+        .unwrap();
+
+        // Hunk 1: válido
+        let r1 = execute_local_tool(
+            "apply_diff",
+            r#"{"path":"service.rs","search":"use old_crate::A;","replace":"use new_crate::A;"}"#,
+            &base,
+            4000,
+            "http://127.0.0.1:8080/v1",
+        )
+        .await;
+        assert!(r1.starts_with("[OK]"), "r1: {}", r1);
+
+        // Hunk 2: inválido (no debe revertir el hunk 1 ni bloquear el hunk 3)
+        let r2 = execute_local_tool(
+            "apply_diff",
+            r#"{"path":"service.rs","search":"fn one() -> i32 {\n    999\n}","replace":"fn one() -> i32 {\n    10\n}"}"#,
+            &base,
+            4000,
+            "http://127.0.0.1:8080/v1",
+        )
+        .await;
+        assert!(r2.starts_with("[ERROR apply_diff]"), "r2: {}", r2);
+        assert!(r2.contains("Fragmento más cercano"), "r2: {}", r2);
+
+        // Hunk 3: válido
+        let r3 = execute_local_tool(
+            "apply_diff",
+            r#"{"path":"service.rs","search":"fn two() -> i32 {\n    2\n}","replace":"fn two() -> i32 {\n    20\n}"}"#,
+            &base,
+            4000,
+            "http://127.0.0.1:8080/v1",
+        )
+        .await;
+        assert!(r3.starts_with("[OK]"), "r3: {}", r3);
+
+        let final_content = fs::read_to_string(&file).unwrap();
+        assert!(final_content.contains("use new_crate::A;"));
+        assert!(final_content.contains("fn one() -> i32 {\n    1\n}"));
+        assert!(final_content.contains("fn two() -> i32 {\n    20\n}"));
+
+        let _ = fs::remove_dir_all(&base);
     }
 }
 

@@ -55,7 +55,7 @@ agents:
       1. NO escribas bloques largos de código ni hagas depuración pesada tú mismo. En `delegate_subagent`, mantén `task_brief` conciso (<150 palabras); NUNCA pegues código HTML/CSS/JS/Rust completo dentro de `task_brief`.
       2. Divide el objetivo del usuario en hitos con checkboxes (`- [ ]` / `- [x]`) usando `update_plan` en `.harness/PLAN.md`, y actualiza el checklist cada vez que un subagente complete un paso para alimentar la barra de avance.
       3. Si la solicitud es ambigua y falta un dato crítico (puerto, stack, alcance), usa `clarify` con 2-4 opciones antes de delegar. Guarda convenciones estables del proyecto con `project_memory` (`append`).
-      4. Delega secuencialmente a tus especialistas (`explorer`, `software_architect`, `semi_sr_dev`, `qa_tester`, `web_researcher`, `frontend_inspector`, `security_auditor`). Si un subagente alcanza su límite de pasos, NO divagues leyendo archivos enteros tú mismo: divide la tarea restante en un encargo más pequeño y vuelve a delegar.
+      4. Delega secuencialmente subtareas atómicas (máximo 1 archivo objetivo o ≤5 errores por `delegate_subagent`) a tus especialistas (`explorer`, `software_architect`, `semi_sr_dev`, `qa_tester`, `web_researcher`, `frontend_inspector`, `security_auditor`). Para tareas de solo-diagnóstico (`cargo check`, builds o tests sin editar archivos), delega SIEMPRE a `qa_tester` (nunca a `semi_sr_dev`). Si un subagente alcanza su límite de pasos, NO divagues leyendo archivos enteros tú mismo: divide la tarea restante en un encargo más pequeño y vuelve a delegar.
       5. Evalúa el reporte compacto de cada subagente y entrega conclusiones verificables cuando termines.
 
   software_architect:
@@ -69,7 +69,7 @@ agents:
     reasoning_budget: 1024
     max_iterations: 15
     auto_compact_context: true
-    compact_threshold_tokens: 16384
+    compact_threshold_tokens: 32768
     max_report_chars: 4000
     allowed_tools:
       - "list_files"
@@ -121,7 +121,7 @@ agents:
     max_tokens: 6144
     max_iterations: 18
     auto_compact_context: true
-    compact_threshold_tokens: 16384
+    compact_threshold_tokens: 32768
     allowed_tools:
       - "read_file"
       - "apply_diff"
@@ -140,7 +140,7 @@ agents:
       Recibes una especificación puntual del TI Manager para implementar una funcionalidad o refactorizar un archivo.
       REGLAS:
       1. Lee las líneas necesarias con `read_file` antes de editar.
-      2. En archivos existentes (>100 líneas), usa SIEMPRE `apply_diff` (cambios quirúrgicos SEARCH/REPLACE) en lugar de reescribir el archivo entero con `write_file`. Usa `write_file` solo para archivos nuevos o pequeños (<100 líneas).
+      2. En archivos existentes (>100 líneas), usa SIEMPRE `apply_diff` (cambios quirúrgicos SEARCH/REPLACE) en lugar de reescribir el archivo entero con `write_file`. Cuando necesites editar de 2 a 4 zonas independientes y no solapadas del mismo archivo, emite múltiples llamadas `apply_diff` cortas en un mismo turno para ahorrar iteraciones sin riesgo de JSON roto (cada bloque se aplica de forma independiente). Usa `write_file` solo para archivos nuevos o pequeños (<100 líneas).
       3. Revisa siempre el `[Diagnóstico Post-Edición]` que devuelven `apply_diff` y `write_file`; si reporta un error de sintaxis, corrígelo en el turno siguiente.
       4. Antes de reportar como terminado código nuevo en Rust/JS/Python, valida compilación o sintaxis (`cargo check`, `py_compile`, etc.) respetando la sintaxis de tu terminal (Windows PowerShell o Linux sh/bash).
       5. Al concluir, responde con un resumen breve (<200 palabras) de qué archivos modificaste y por qué.
@@ -218,7 +218,7 @@ agents:
     reasoning_budget: 2048
     max_iterations: 30
     auto_compact_context: true
-    compact_threshold_tokens: 16384
+    compact_threshold_tokens: 32768
     max_report_chars: 6000
     allowed_tools:
       - "list_files"

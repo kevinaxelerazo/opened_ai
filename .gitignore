@@ -7,6 +7,7 @@
 
 # Local harness runtime & session state
 /.harness/
+**/.harness/
 *.bin
 *.log
 /llama.log
@@ -15,6 +16,10 @@
 /config/config.local.yml
 /config/config.local.json
 MEMORY.md
+
+# Separate complementary project (cowork_for_opened_ai) & legacy Linux mirror
+/cowork_mobile/
+/harness_to_linux/
 
 # OS / Editor files
 .DS_Store
